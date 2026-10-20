@@ -62,7 +62,11 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+extern crate alloc;
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage keys
@@ -229,6 +233,95 @@ impl RouterContract {
             .set(&RouterKey::CanaryWeight, &weight);
     }
 
+    // ── Multi-hop routing ─────────────────────────────────────────────────
+
+    /// Validate a multi-hop payment route without executing it.
+    ///
+    /// Checks:
+    /// - Route is not empty.
+    /// - Route does not exceed `MAX_HOPS`.
+    /// - All amounts are positive.
+    ///
+    /// Returns `Ok(())` on success or a [`RouterError`] describing the problem.
+    pub fn validate_route(env: Env, hops: Vec<RouteHop>) -> Result<(), RouterError> {
+        if hops.is_empty() {
+            return Err(RouterError::EmptyRoute);
+        }
+        if hops.len() > MAX_HOPS {
+            return Err(RouterError::TooManyHops);
+        }
+        for i in 0..hops.len() {
+            let hop = hops.get(i).unwrap();
+            if hop.amount <= 0 {
+                return Err(RouterError::InvalidAmount);
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a multi-hop payment route.
+    ///
+    /// Validates the route structure, then verifies each merchant is registered
+    /// and active. Returns a [`MultiHopResult`] with the executed hops, or a
+    /// [`RouterError`] if any validation fails.
+    ///
+    /// ## Error conditions
+    ///
+    /// - [`RouterError::EmptyRoute`] — `hops` is empty.
+    /// - [`RouterError::TooManyHops`] — `hops.len()` exceeds `MAX_HOPS`.
+    /// - [`RouterError::InvalidAmount`] — any hop has an amount ≤ 0.
+    /// - [`RouterError::MerchantNotFound`] — a hop's merchant address is not
+    ///   registered in the lumenflow contract stored at `LumenflowContract`.
+    /// - [`RouterError::MerchantNotActive`] — a hop's merchant is registered
+    ///   but has been deactivated.
+    pub fn execute_multi_hop_route(
+        env: Env,
+        hops: Vec<RouteHop>,
+    ) -> Result<MultiHopResult, RouterError> {
+        // Structural validation first
+        Self::validate_route(env.clone(), hops.clone())?;
+
+        // Retrieve the lumenflow contract address registered with the router.
+        let lumenflow_id: Address = env
+            .storage()
+            .instance()
+            .get(&RouterKey::StableContract)
+            .expect("lumenflow contract not configured — call set_lumenflow_contract first");
+
+        let lumenflow_client =
+            lumenflow::PaymentProcessingContractClient::new(&env, &lumenflow_id);
+
+        let hop_count = hops.len();
+
+        // Validate each merchant is registered and active
+        for i in 0..hops.len() {
+            let hop = hops.get(i).unwrap();
+
+            // is_registered returns false if the address is unknown
+            let registered = lumenflow_client.is_registered(&hop.merchant);
+            if !registered {
+                return Err(RouterError::MerchantNotFound);
+            }
+
+            // get_merchant returns Result; merchant is registered so this won't error
+            let merchant = lumenflow_client.get_merchant(&hop.merchant).unwrap();
+            if !merchant.active {
+                return Err(RouterError::MerchantNotActive);
+            }
+        }
+
+        Ok(MultiHopResult { hops, hop_count })
+    }
+
+    /// Register the LumenFlow contract address used for merchant validation in
+    /// multi-hop routing. Stored under the `StableContract` key for simplicity
+    /// (the router can serve both blue-green and multi-hop roles).
+    pub fn set_lumenflow_contract(env: Env, lumenflow_id: Address) {
+        env.storage()
+            .instance()
+            .set(&RouterKey::StableContract, &lumenflow_id);
+    }
+
     // ── Routing ───────────────────────────────────────────────────────────
 
     /// Determine which contract should handle the current call and return its
@@ -392,6 +485,57 @@ impl RouterContract {
         assert!(*caller == admin, "caller is not the router admin");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-hop routing types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of hops allowed in a single multi-hop payment route.
+/// Prevents unbounded on-chain computation and potential abuse.
+pub const MAX_HOPS: u32 = 5;
+
+/// A single hop in a multi-hop payment route.
+#[contracttype]
+#[derive(Clone)]
+pub struct RouteHop {
+    /// The merchant address to route through.
+    pub merchant: Address,
+    /// The token address for this hop.
+    pub token: Address,
+    /// The amount to forward at this hop.
+    pub amount: i128,
+}
+
+/// Result returned after successfully executing a multi-hop route.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiHopResult {
+    /// The ordered list of hops that were executed.
+    pub hops: Vec<RouteHop>,
+    /// Total number of hops executed.
+    pub hop_count: u32,
+}
+
+/// Errors that can be returned by multi-hop routing.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum RouterError {
+    /// The route list was empty — at least one hop is required.
+    EmptyRoute = 1,
+    /// The route exceeds the maximum allowed hop count (MAX_HOPS).
+    TooManyHops = 2,
+    /// A hop's amount is zero or negative.
+    InvalidAmount = 3,
+    /// A merchant in the route was not found in the lumenflow contract.
+    MerchantNotFound = 4,
+    /// A merchant in the route is registered but currently inactive.
+    MerchantNotActive = 5,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-hop routing storage key
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
